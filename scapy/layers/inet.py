@@ -2086,21 +2086,22 @@ class TCP_SAckBot(Automaton):
         shouldSack=False
         shouldAck=False
         shouldDrop=False
-        if data and self.l4[TCP].ack == pkt[TCP].seq: #start of pipeline
+        if data and self.l4[TCP].ack > pkt[TCP].seq: #retransmit of unneeded recv'd
+            self.l4[TCP].ack=self.sack
+            self.l4[TCP].options = []
+            self.l4[TCP].flags = "A"
+            self.send(self.l4)
+        elif data and self.l4[TCP].ack == pkt[TCP].seq: #start of pipeline
             if len(self.sackBuf) == 4: #sackBuf full, just Ack it
                 shouldAck=True
             if len(self.sackBuf) < 4: #holes not maxed, drop this 
                 shouldDrop=True
-        elif pkt[TCP].seq > sackBuf[len(sackBuf) -1][1]: # new data creating new hole
-            if len(self.sackBuf) > 0: 
-                if (self.sackBuf[len(sackBuf) - 1][1] != pkt[TCP].seq ):#could create a new hole, sack it
-                    shouldSAck = True
-                else: #sacking does not create a new hole and kk
-                    shouldDrop = True
-        else: # server retransmitting a hole or earlier in pupeline
-            shouldSAck = True 
+        else:
+            if len(self.sackBuf) < 4: 
+                shouldSack=True
 
         data = raw(pkt[TCP].payload)
+
         if data and self.shouldDrop:
             return
         if data and self.shouldACK:
@@ -2120,9 +2121,8 @@ class TCP_SAckBot(Automaton):
             i = pkt[TCP].seq
             handled = False
 
-            #check if we get a new hole
             if len(sackBuf) > 0 and len(sackBuf) < 4: #should not be here unless space in sack buf
-                if self.sackBuf[len(sackBuf) - 1][1] != i:  #got a hole for free
+                if self.sackBuf[len(sackBuf) - 1][1] < i:  #got a hole for free
                     self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)]
                     return
 
@@ -2136,6 +2136,9 @@ class TCP_SAckBot(Automaton):
                     self.sackBuf[j+1][0] = i
                     handled=True
                     break
+                elif i > self.sackBuf[j][1] and i + len(data) + 1 < self.sackBuf[j+1][0]: #does not fill hole opt 2
+                    if (len(self.sackBuf) < 4):
+                        self.sackBuf.insert(j+1,(i,i+len(data)+1))
             
             if handled:#we were able to handle, exit
                 self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
