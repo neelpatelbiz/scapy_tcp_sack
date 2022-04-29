@@ -2114,15 +2114,16 @@ class TCP_SAckBot(Automaton):
         elif data and self.shouldAck:
             print("in ack")
             self.sack = self.l4[TCP].ack #?
+            self.l4[TCP].ack += len(data)
+            self.bytes += len(data)
             if len(self.sackBuf) >= 1: #clean up first sack entry
                 if(self.sackBuf[0][0] == self.l4[TCP].ack):
                     del(self.sackBuf[0])
-            self.l4[TCP].ack += len(data)
-            self.bytes += len(data)
+            self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
             self.l4[TCP].flags = "A"
             self.send(self.l4)
-            return
 
+            return
         if data and self.shouldSack:
             i = pkt[TCP].seq
             print("in sack %d %d" %(i, i+len(data)))
@@ -2133,15 +2134,16 @@ class TCP_SAckBot(Automaton):
                     print("is new seq:%d > last sack re: %d" %(i , self.sackBuf[len(self.sackBuf)-1][1]))
                 if len(self.sackBuf) == 0:  #got a hole for free
                     print("freebie")
-                    self.sackBuf += [(pkt.seq,pkt.seq+len(data))]
+                    self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)]
                     self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
                     self.l4[TCP].flags = "A"
                     self.send(self.l4)
+                    self.bytes += len(data)
                     return
                 elif len(self.sackBuf) > 0:
                         if i > self.sackBuf[len(self.sackBuf)-1][1]:
                             print("freebie 2")
-                            self.sackBuf += [(pkt.seq,pkt.seq+len(data) )]
+                            self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)]
                             self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
                             self.l4[TCP].flags = "A"
                             self.send(self.l4)
@@ -2159,8 +2161,8 @@ class TCP_SAckBot(Automaton):
                     handled=True
                     break
                 elif i > self.sackBuf[j][1] and (i + len(data) + 1) < self.sackBuf[j+1][0]: #does not fill hole opt 2
-                    print("fraghole")
                     if (len(self.sackBuf) < 4):
+                        print("fraghole")
                         self.sackBuf.insert(j+1,(i,i+len(data)+1))
                         handled=True
                     break
@@ -2171,7 +2173,7 @@ class TCP_SAckBot(Automaton):
                 self.l4[TCP].flags = "A"
                 self.send(self.l4)
             else:
-                print("sack had to drop")
+                print("check for better hole")
                 #check if we can get a better hole
                 return #could not be placed without filling a hole and did not create a new hole
 
