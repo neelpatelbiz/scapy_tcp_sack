@@ -1,4 +1,3 @@
-# This file is part of Scapy
 # See http://www.secdev.org/projects/scapy for more information
 # Copyright (C) Philippe Biondi <phil@secdev.org>
 # This program is published under a GPLv2 license
@@ -1993,6 +1992,9 @@ class TCP_SAckBot(Automaton):
         self.bytes = 0
         self.maxbytes = (246 * 1024)
         self.sackBuf = []
+        self.dropCtr = 0
+        self.maxDrop = 3
+        self.lastServ = 0
 
         self.shouldSack=False
         self.shouldAck=False
@@ -2086,95 +2088,78 @@ class TCP_SAckBot(Automaton):
 
     @ATMT.action(incoming_data_received)
     def receive_data(self, pkt):
-        self.shouldSack=False
-        self.shouldAck=False
-        self.shouldDrop=False
         data = raw(pkt[TCP].payload)
-
-        if data and self.l4[TCP].ack > pkt[TCP].seq: #retransmit of unneeded recv'd
-            print("already ahead")
-            self.l4[TCP].ack=self.sack
-            self.l4[TCP].options = []
-            self.l4[TCP].flags = "A"
-            self.send(self.l4)
-            return
-        elif data and self.l4[TCP].ack == pkt[TCP].seq: #start of pipeline
-            if len(self.sackBuf) == 4: #sackBuf full, just Ack it
-                self.shouldAck=True
-            if len(self.sackBuf) < 4: #holes not maxed, drop this 
-                self.shouldDrop=True
-        else:
-            if len(self.sackBuf) < 4: 
-                self.shouldSack=True
-
-
-        if data and self.shouldDrop:
-            print("in drop")
-            return
-        elif data and self.shouldAck:
-            print("in ack")
-            self.sack = self.l4[TCP].ack #?
-            self.l4[TCP].ack += len(data)
-            self.bytes += len(data)
-            if len(self.sackBuf) >= 1: #clean up first sack entry
-                if(self.sackBuf[0][0] == self.l4[TCP].ack):
-                    del(self.sackBuf[0])
-            self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
-            self.l4[TCP].flags = "A"
-            self.send(self.l4)
-
-            return
-        if data and self.shouldSack:
+        if data:
             i = pkt[TCP].seq
-            print("in sack %d %d" %(i, i+len(data)))
             handled=False
 
-            if len(self.sackBuf) < 4: #should not be here unless space in sack buf
-                if len(self.sackBuf) > 0:
-                    print("is new seq:%d > last sack re: %d" %(i , self.sackBuf[len(self.sackBuf)-1][1]))
-                if len(self.sackBuf) == 0:  #got a hole for free
-                    print("freebie")
-                    self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)]
-                    self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
-                    self.l4[TCP].flags = "A"
-                    self.send(self.l4)
-                    self.bytes += len(data)
-                    return
-                elif len(self.sackBuf) > 0:
-                        if i > self.sackBuf[len(self.sackBuf)-1][1]:
-                            print("freebie 2")
-                            self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)]
-                            self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
-                            self.l4[TCP].flags = "A"
-                            self.send(self.l4)
-                            return
-            #try placing without filling hole
+            if len(self.sackBuf) < 4 and i == self.l4[TCP].ack: #doesn't give new hole
+                return
+            
+            if len(self.sackBuf) == 0: #have no holdes, create one
+                print("freebie")
+                self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)]
+                self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
+                self.l4[TCP].flags = "A"
+                self.send(self.l4)
+                self.bytes += len(data)
+                return
+            elif len(self.sackBuf) > 0: #already have holes
+                    if len(self.sackBuf) < 4 and i > self.sackBuf[len(self.sackBuf)-1][1]: #if space and makes hole
+                        print("freebie 2")
+                        self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)]
+                        self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
+                        self.l4[TCP].flags = "A"
+                        self.send(self.l4)
+                        return
+                    elif i > self.sackBuf[len(self.sackBuf)-1][1]: #holes maxed, increase frag by
+                        print("freebie 3")
+                        del(self.sackBuf[1]) #removing intermediate sACK
+                        self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)] #and adding latest SAck
+                        self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
+                        self.l4[TCP].flags = "A"
+                        self.send(self.l4)
+                        return
+
+
+            #check if new data preserves fragmentation
             for j in range(0, len(self.sackBuf) - 1 ):
                 if i == self.sackBuf[j][1] and (i + len(data)) < self.sackBuf[j+1][0]: #does not fill hole opt 1
-                    print("lowHole")
-                    self.sackBuf[j][1] = i + len(data) + 1
+                    #print("lowHole %d:%d" %(self.sackBuf[j][1],self.sackBuf[j+1][0]))
+                    print("lowHole ")
+                    self.sackBuf[j] = (self.sackBuf[j][0], (i + len(data)))
                     handled=True
+                    print("handled")
                     break
                 elif i > self.sackBuf[j][1] and (i + len(data) + 1) == self.sackBuf[j+1][0]: #does not fill hole opt 2
                     print("highhole")
                     self.sackBuf[j+1][0] = i
                     handled=True
                     break
-                elif i > self.sackBuf[j][1] and (i + len(data) + 1) < self.sackBuf[j+1][0]: #does not fill hole opt 2
-                    if (len(self.sackBuf) < 4):
-                        print("fraghole")
-                        self.sackBuf.insert(j+1,(i,i+len(data)+1))
-                        handled=True
-                    break
-
             
             if handled:#we were able to handle, exit
                 self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
                 self.l4[TCP].flags = "A"
                 self.send(self.l4)
-            else:
-                print("check for better hole")
-                #check if we can get a better hole
+            else: #new data does not preserve fragmentation or improve it
+                if self.lastServ == i:
+                    self.dropCtr+=1
+                self.lastServ=i
+                if(self.dropCtr == self.maxDrop):
+                    print("server persisted")
+                    self.sack = self.l4[TCP].ack
+                    self.l4[TCP].ack += len(data)
+                    self.l4[TCP].flags = "A"
+                    self.bytes += len(data)
+                    if(self.sackBuf[0][0] >= self.l4[TCP].ack):#should only be here if already sacked
+                        del(self.sackBuf[0])
+                    self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
+                    # Answer with an Ack
+                    self.send(self.l4)
+                    # Process data - will be sent to the SuperSocket through this
+                    self.rcvbuf.on_packet_received(pkt)
+                    self.dropCtr=0
+                    
                 return #could not be placed without filling a hole and did not create a new hole
 
 
