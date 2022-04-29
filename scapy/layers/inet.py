@@ -19,13 +19,13 @@ from collections import defaultdict
 
 from scapy.utils import checksum, do_graph, incremental_label, \
     linehexdump, strxor, whois, colgen
-from scapy.ansmachine import AnsweringMachine, AnsweringMachineUtils
+from scapy.ansmachine import AnsweringMachine
 from scapy.base_classes import Gen, Net
 from scapy.data import ETH_P_IP, ETH_P_ALL, DLT_RAW, DLT_RAW_ALT, DLT_IPV4, \
     IP_PROTOS, TCP_SERVICES, UDP_SERVICES
 from scapy.layers.l2 import Ether, Dot3, getmacbyip, CookedLinux, GRE, SNAP, \
     Loopback
-from scapy.compat import raw, chb, orb, bytes_encode, Optional
+from scapy.compat import raw, chb, orb, bytes_encode
 from scapy.config import conf
 from scapy.extlib import plt, MATPLOTLIB, MATPLOTLIB_INLINED, \
     MATPLOTLIB_DEFAULT_PLOT_KARGS
@@ -64,7 +64,8 @@ from scapy.pton_ntop import inet_pton
 
 import scapy.as_resolvers
 
-import scapy.libs.six as six
+import scapy.modules.six as six
+from scapy.modules.six.moves import range
 
 ####################
 #  IP Tools class  #
@@ -299,10 +300,8 @@ TCPOptions = (
      8: ("Timestamp", "!II"),
      14: ("AltChkSum", "!BH"),
      15: ("AltChkSumOpt", None),
-     19: ("MD5", "16s"),
      25: ("Mood", "!p"),
      28: ("UTO", "!H"),
-     29: ("AO", None),
      34: ("TFO", "!II"),
      # RFC 3692
      # 253: ("Experiment", "!HHHH"),
@@ -317,30 +316,10 @@ TCPOptions = (
      "Timestamp": 8,
      "AltChkSum": 14,
      "AltChkSumOpt": 15,
-     "MD5": 19,
      "Mood": 25,
      "UTO": 28,
-     "AO": 29,
      "TFO": 34,
      })
-
-
-class TCPAOValue(Packet):
-    """Value of TCP-AO option"""
-    fields_desc = [
-        ByteField("keyid", None),
-        ByteField("rnextkeyid", None),
-        StrLenField("mac", "", length_from=lambda p:len(p.original) - 2),
-    ]
-
-
-def get_tcpao(tcphdr):
-    # type: (TCP) -> Optional[TCPAOValue]
-    """Get the TCP-AO option from the header"""
-    for optid, optval in tcphdr.options:
-        if optid == 'AO':
-            return optval
-    return None
 
 
 class RandTCPOptions(VolatileValue):
@@ -419,8 +398,6 @@ class TCPOptionsField(StrField):
                 oname, ofmt = TCPOptions[0][onum]
                 if onum == 5:  # SAck
                     ofmt += "%iI" % (len(oval) // 4)
-                if onum == 29:  # AO
-                    oval = TCPAOValue(oval)
                 if ofmt and struct.calcsize(ofmt) == len(oval):
                     oval = struct.unpack(ofmt, oval)
                     if len(oval) == 1:
@@ -458,8 +435,6 @@ class TCPOptionsField(StrField):
                         if not isinstance(oval, tuple):
                             oval = (oval,)
                         oval = struct.pack(ofmt, *oval)
-                    if onum == 29:  # AO
-                        oval = bytes(oval)
                 else:
                     warning("Option [%s] unknown. Skipped.", oname)
                     continue
@@ -657,14 +632,18 @@ class IP(Packet, IPTools):
         return lst
 
 
-def in4_pseudoheader(proto, u, plen):
-    # type: (int, IP, int) -> bytes
-    """IPv4 Pseudo Header as defined in RFC793 as bytes
-
-    :param proto: value of upper layer protocol
-    :param u: IP layer instance
-    :param plen: the length of the upper layer and payload
+def in4_chksum(proto, u, p):
     """
+    As Specified in RFC 2460 - 8.1 Upper-Layer Checksums
+
+    Performs IPv4 Upper Layer checksum computation. Provided parameters are:
+    - 'proto' : value of upper layer protocol
+    - 'u'  : IP upper layer instance
+    - 'p'  : the payload of the upper layer provided as a string
+    """
+    if not isinstance(u, IP):
+        warning("No IP underlayer to compute checksum. Leaving null.")
+        return 0
     if u.len is not None:
         if u.ihl is None:
             olen = sum(len(x) for x in u.options)
@@ -673,7 +652,7 @@ def in4_pseudoheader(proto, u, plen):
             ihl = u.ihl
         ln = max(u.len - 4 * ihl, 0)
     else:
-        ln = plen
+        ln = len(p)
 
     # Filter out IPOption_LSRR and IPOption_SSRR
     sr_options = [opt for opt in u.options if isinstance(opt, IPOption_LSRR) or
@@ -688,72 +667,12 @@ def in4_pseudoheader(proto, u, plen):
         message += "Falling back to IP.dst for checksum computation."
         warning(message, len_sr_options)
 
-    return struct.pack("!4s4sHH",
-                       inet_pton(socket.AF_INET, u.src),
-                       inet_pton(socket.AF_INET, u.dst),
-                       proto,
-                       ln)
-
-
-def in4_chksum(proto, u, p):
-    # type: (int, IP, bytes) -> int
-    """IPv4 Pseudo Header checksum as defined in RFC793
-
-    :param nh: value of upper layer protocol
-    :param u: upper layer instance
-    :param p: the payload of the upper layer provided as a string
-    """
-    if not isinstance(u, IP):
-        warning("No IP underlayer to compute checksum. Leaving null.")
-        return 0
-    psdhdr = in4_pseudoheader(proto, u, len(p))
+    psdhdr = struct.pack("!4s4sHH",
+                         inet_pton(socket.AF_INET, u.src),
+                         inet_pton(socket.AF_INET, u.dst),
+                         proto,
+                         ln)
     return checksum(psdhdr + p)
-
-
-def _is_ipv6_layer(p):
-    # type: (Packet) -> bytes
-    return (isinstance(p, scapy.layers.inet6.IPv6) or
-            isinstance(p, scapy.layers.inet6._IPv6ExtHdr))
-
-
-def tcp_pseudoheader(tcp):
-    # type: (TCP) -> bytes
-    """Pseudoheader of a TCP packet as bytes
-
-    Requires underlayer to be either IP or IPv6
-    """
-    if isinstance(tcp.underlayer, IP):
-        plen = len(bytes(tcp))
-        return in4_pseudoheader(socket.IPPROTO_TCP, tcp.underlayer, plen)
-    elif conf.ipv6_enabled and _is_ipv6_layer(tcp.underlayer):
-        plen = len(bytes(tcp))
-        return raw(scapy.layers.inet6.in6_pseudoheader(
-            socket.IPPROTO_TCP, tcp.underlayer, plen))
-    else:
-        raise ValueError("TCP packet does not have IP or IPv6 underlayer")
-
-
-def calc_tcp_md5_hash(tcp, key):
-    # type: (TCP, bytes) -> bytes
-    """Calculate TCP-MD5 hash from packet and return a 16-byte string"""
-    import hashlib
-
-    h = hashlib.md5()  # nosec
-    tcp_bytes = bytes(tcp)
-    h.update(tcp_pseudoheader(tcp))
-    h.update(tcp_bytes[:16])
-    h.update(b"\x00\x00")
-    h.update(tcp_bytes[18:])
-    h.update(key)
-
-    return h.digest()
-
-
-def sign_tcp_md5(tcp, key):
-    # type: (TCP, bytes) -> None
-    """Append TCP-MD5 signature to tcp packet"""
-    sig = calc_tcp_md5_hash(tcp, key)
-    tcp.options = tcp.options + [('MD5', sig)]
 
 
 class TCP(Packet):
@@ -1384,7 +1303,7 @@ class TracerouteResult(SndRcvList):
             p.join()
 
     def trace3D_notebook(self):
-        """Same than trace3D, used when ran from Jupyter notebooks"""
+        """Same than trace3D, used when ran from Jupyther notebooks"""
         trace = self.get_trace()
         import vpython
 
@@ -1883,7 +1802,6 @@ class TCP_client(Automaton):
     :param ip: the ip to connect to
     :param port:
     """
-
     def parse_args(self, ip, port, *args, **kargs):
         from scapy.sessions import TCPSession
         self.dst = str(Net(ip))
@@ -1980,6 +1898,257 @@ class TCP_client(Automaton):
             self.send(self.l4)
             # Process data - will be sent to the SuperSocket through this
             self.rcvbuf.on_packet_received(pkt)
+
+    @ATMT.ioevent(ESTABLISHED, name="tcp", as_supersocket="tcplink")
+    def outgoing_data_received(self, fd):
+        raise self.ESTABLISHED().action_parameters(fd.recv())
+
+    @ATMT.action(outgoing_data_received)
+    def send_data(self, d):
+        self.l4[TCP].flags = "PA"
+        self.send(self.l4 / d)
+        self.l4[TCP].seq += len(d)
+
+    @ATMT.receive_condition(ESTABLISHED)
+    def reset_received(self, pkt):
+        if pkt[TCP].flags.R:
+            raise self.CLOSED()
+
+    @ATMT.receive_condition(ESTABLISHED)
+    def fin_received(self, pkt):
+        if pkt[TCP].flags.F:
+            raise self.LAST_ACK().action_parameters(pkt)
+
+    @ATMT.action(fin_received)
+    def send_finack(self, pkt):
+        self.l4[TCP].flags = "FA"
+        self.l4[TCP].ack = pkt[TCP].seq + 1
+        self.send(self.l4)
+        self.l4[TCP].seq += 1
+
+    @ATMT.receive_condition(LAST_ACK)
+    def ack_of_fin_received(self, pkt):
+        if pkt[TCP].flags.A:
+            raise self.CLOSED()
+
+    @ATMT.condition(STOP)
+    def stop_requested(self):
+        raise self.STOP_SENT_FIN_ACK()
+
+    @ATMT.action(stop_requested)
+    def stop_send_finack(self):
+        self.l4[TCP].flags = "FA"
+        self.send(self.l4)
+        self.l4[TCP].seq += 1
+
+    @ATMT.receive_condition(STOP_SENT_FIN_ACK)
+    def stop_fin_received(self, pkt):
+        if pkt[TCP].flags.F:
+            raise self.CLOSED().action_parameters(pkt)
+
+    @ATMT.action(stop_fin_received)
+    def stop_send_ack(self, pkt):
+        self.l4[TCP].flags = "A"
+        self.l4[TCP].ack = pkt[TCP].seq + 1
+        self.send(self.l4)
+
+    @ATMT.timeout(SYN_SENT, 1)
+    def syn_ack_timeout(self):
+        raise self.CLOSED()
+
+    @ATMT.timeout(STOP_SENT_FIN_ACK, 1)
+    def stop_ack_timeout(self):
+        raise self.CLOSED()
+
+#############################
+#  Sack TCP client          #
+#############################
+
+
+class TCP_SAckBot(Automaton):
+    """
+    Creates a TCP Client Automaton.
+    This automaton will handle TCP 3-way handshake.
+
+    Usage: the easiest usage is to use it as a SuperSocket.
+        >>> a = TCP_client.tcplink(HTTP, "www.google.com", 80)
+        >>> a.send(HTTPRequest())
+        >>> a.recv()
+
+    :param ip: the ip to connect to
+    :param port:
+    """
+    def parse_args(self, ip, port, *args, **kargs):
+        from scapy.sessions import TCPSession
+        self.dst = str(Net(ip))
+        self.dport = port
+        self.sport = random.randrange(0, 2**16)
+        self.l4 = IP(dst=ip) / TCP(sport=self.sport, dport=self.dport, flags=0,
+                                   seq=random.randrange(0, 2**32))
+        self.src = self.l4.src
+        self.sack = self.l4[TCP].ack
+        self.rel_seq = None
+        self.rcvbuf = TCPSession(prn=self._transmit_packet, store=False)
+
+        self.bytes = 0
+        self.maxbytes = (246 * 1024)
+        self.sackBuf = []
+
+
+        bpf = "host %s  and host %s and port %i and port %i" % (self.src,
+                                                                self.dst,
+                                                                self.sport,
+                                                                self.dport)
+        Automaton.parse_args(self, filter=bpf, **kargs)
+
+    def _transmit_packet(self, pkt):
+        """Transmits a packet from TCPSession to the SuperSocket"""
+        self.oi.tcp.send(raw(pkt[TCP].payload))
+
+    def master_filter(self, pkt):
+        return (IP in pkt and
+                pkt[IP].src == self.dst and
+                pkt[IP].dst == self.src and
+                TCP in pkt and
+                pkt[TCP].sport == self.dport and
+                pkt[TCP].dport == self.sport and
+                self.l4[TCP].seq >= pkt[TCP].ack and  # XXX: seq/ack 2^32 wrap up  # noqa: E501
+                ((self.l4[TCP].ack == 0) or (self.sack <= pkt[TCP].seq <= self.l4[TCP].ack + pkt[TCP].window)))  # noqa: E501
+
+    @ATMT.state(initial=1)
+    def START(self):
+        pass
+
+    @ATMT.state()
+    def SYN_SENT(self):
+        pass
+
+    @ATMT.state()
+    def ESTABLISHED(self):
+        pass
+
+    @ATMT.state()
+    def SAck(self):
+        pass
+
+    @ATMT.state()
+    def DROP(self):
+        pass
+
+    @ATMT.state()
+    def LAST_ACK(self):
+        pass
+
+    @ATMT.state(final=1)
+    def CLOSED(self):
+        pass
+
+    @ATMT.state(stop=1)
+    def STOP(self):
+        pass
+
+    @ATMT.state()
+    def STOP_SENT_FIN_ACK(self):
+        pass
+
+    @ATMT.condition(START)
+    def connect(self):
+        raise self.SYN_SENT()
+
+    @ATMT.action(connect)
+    def send_syn(self):
+        self.l4[TCP].flags = "S"
+        self.l4[TCP].options = [('MSS', 0x30), ('SAckOK', b'') ]
+        self.send(self.l4)
+        self.l4[TCP].options = []
+        self.l4[TCP].seq += 1
+
+    @ATMT.receive_condition(SYN_SENT)
+    def synack_received(self, pkt):
+        if pkt[TCP].flags.SA:
+            raise self.ESTABLISHED().action_parameters(pkt)
+
+    @ATMT.action(synack_received)
+    def send_ack_of_synack(self, pkt):
+        self.l4[TCP].ack = pkt[TCP].seq + 1
+        self.l4[TCP].flags = "A"
+        self.send(self.l4)
+
+    @ATMT.receive_condition(ESTABLISHED)
+    def incoming_data_received(self, pkt):
+        if self.bytes >= self.maxbytes:
+            raise self.STOP_SENT_FIN_ACK()
+        if not isinstance(pkt[TCP].payload, (NoPayload, conf.padding_layer)):
+            raise self.ESTABLISHED().action_parameters(pkt)
+
+    @ATMT.action(incoming_data_received)
+    def receive_data(self, pkt):
+        shouldSack=False
+        shouldAck=False
+        shouldDrop=False
+        if data and self.l4[TCP].ack == pkt[TCP].seq: #start of pipeline
+            if len(self.sackBuf) == 4: #sackBuf full, just Ack it
+                shouldAck=True
+            if len(self.sackBuf) < 4: #holes not maxed, drop this 
+                shouldDrop=True
+        elif pkt[TCP].seq > sackBuf[len(sackBuf) -1][1]: # new data creating new hole
+            if len(self.sackBuf) > 0: 
+                if (self.sackBuf[len(sackBuf) - 1][1] != pkt[TCP].seq ):#could create a new hole, sack it
+                    shouldSAck = True
+                else: #sacking does not create a new hole and kk
+                    shouldDrop = True
+        else: # server retransmitting a hole or earlier in pupeline
+            shouldSAck = True 
+
+        data = raw(pkt[TCP].payload)
+        if data and self.shouldDrop:
+            return
+        if data and self.shouldACK:
+            self.sack = self.l4[TCP].ack #?
+            self.l4[TCP].ack += len(data)
+            self.bytes += len(data)
+            self.l4[TCP].options = []
+            self.l4[TCP].flags = "A"
+            self.send(self.l4)
+
+            if len(self.sackBuf) >= 1: #clean up first sack entry
+                if(self.sackBuf[0][0] == self.l4[TCP].ack):
+                    del(self.sackBuf[0])
+            return
+
+        if data and self.shouldSACK:
+            i = pkt[TCP].seq
+            handled = False
+
+            #check if we get a new hole
+            if len(sackBuf) > 0 and len(sackBuf) < 4: #should not be here unless space in sack buf
+                if self.sackBuf[len(sackBuf) - 1][1] != i:  #got a hole for free
+                    self.sackBuf += [(pkt.seq,pkt.seq+len(data) + 1)]
+                    return
+
+            #try placing without filling hole
+            for j in range(0, len(self.sackBuf) - 1 ):
+                if i == self.sackBuf[j][1] and i + len(data) < self.sackBuf[j+1][0]: #does not fill hole opt 1
+                    self.sackBuf[j][1] = i + len(data) + 1
+                    handled=True
+                    break
+                elif i > self.sackBuf[j][1] and i + len(data) + 1 == self.sackBuf[j+1][0]: #does not fill hole opt 2
+                    self.sackBuf[j+1][0] = i
+                    handled=True
+                    break
+            
+            if handled:#we were able to handle, exit
+                self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
+                self.l4[TCP].flags = "A"
+                self.send(self.l4)
+            else:
+                return #could not be placed without filling a hole and did not create a new hole
+
+
+            if len(self.sackBuf) >= 4:
+                del(self.sackBuf[0])
+
+
 
     @ATMT.ioevent(ESTABLISHED, name="tcp", as_supersocket="tcplink")
     def outgoing_data_received(self, fd):
@@ -2170,11 +2339,16 @@ class ICMPEcho_am(AnsweringMachine):
         print("Replying %s to %s" % (reply.getlayer(IP).dst, req.dst))
 
     def make_reply(self, req):
-        reply = AnsweringMachineUtils.reverse_packet(req)
+        reply = req.copy()
         reply[ICMP].type = 0  # echo-reply
         # Force re-generation of the checksum
         reply[ICMP].chksum = None
-        return reply[ICMP].underlayer
+        if req.haslayer(IP):
+            reply[IP].src, reply[IP].dst = req[IP].dst, req[IP].src
+            reply[IP].chksum = None
+        if req.haslayer(Ether):
+            reply[Ether].src, reply[Ether].dst = req[Ether].dst, req[Ether].src
+        return reply
 
 
 conf.stats_classic_protocols += [TCP, UDP, ICMP]
