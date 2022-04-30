@@ -2272,7 +2272,7 @@ class TCP_SAckBot(Automaton):
 			self.send(self.l4)
 			return
 		elif data and self.l4[TCP].ack == pkt[TCP].seq: #start of pipeline
-			if len(self.sackBuf) >= 3 or self.retrans >= 1: #sackBuf full, just Ack it
+			if len(self.sackBuf) >= 4 or self.retrans >= 1: #sackBuf full, just Ack it
 				self.shouldAck=True
 			else: #holes not maxed, drop this 
 				self.shouldDrop=True
@@ -2283,7 +2283,11 @@ class TCP_SAckBot(Automaton):
 
 		if self.shouldDrop:
 			print("in drop")
-			self.retrans+=1
+			self.l4[TCP].ack = self.l4[TCP].ack #?
+			self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
+			self.l4[TCP].flags = "A"
+			self.retrans +=1
+			self.send(self.l4)
 			return
 		elif self.shouldAck:
 			print("in ack")
@@ -2291,8 +2295,12 @@ class TCP_SAckBot(Automaton):
 			self.l4[TCP].ack += len(data)
 			self.bytes += len(data)
 			if len(self.sackBuf) >= 1: #clean up first sack entry
-				if(self.sackBuf[0][0] == self.l4[TCP].ack):
-					del(self.sackBuf[0])
+				if(self.sackBuf[0][0] <= self.l4[TCP].ack):
+					# about to unfragment tx, create disruptive SAck Buffer
+					if(len(self.sackBuf) == 1):
+						self.sackBuf = [ (self.sackBuf[0][0] + 48,self.sackBuf[0][0] + 96) , (self.sackBuf[0][0] + 144, self.sackBuf[0][1]) ]
+					else:
+						del(self.sackBuf[0])
 			self.l4[TCP].options = [('SAck', tuple([k for i in self.sackBuf for k in i]))]
 			self.l4[TCP].flags = "A"
 			self.retrans = 0
@@ -2325,7 +2333,7 @@ class TCP_SAckBot(Automaton):
 							return
 			#try placing without filling hole
 			if len(self.sackBuf) > 0:
-				if i > self.sackBuf[len(self.sackBuf) - 1][0] and i <= self.sackBuf[len(self.sackBuf) - 1][1] and random.randint(0,9) > 1: #coalesce with last
+				if i > self.sackBuf[len(self.sackBuf) - 1][0] and i <= self.sackBuf[len(self.sackBuf) - 1][1] : #coalesce with last
 					le = self.sackBuf[len(self.sackBuf) - 1][0]
 					del(self.sackBuf[len(self.sackBuf) - 1])
 					self.sackBuf+=[(le,i + len(data) + 1 )]
